@@ -35,6 +35,7 @@
 #define FLB_GCS_METADATA_TOKEN_URI \
     "/computeMetadata/v1/instance/service-accounts/default/token"
 #define FLB_GCS_METADATA_TOKEN_SIZE_MAX 14336
+#define FLB_GCS_MIN_TOTAL_FILE_SIZE 1000000
 
 #define FLB_GCS_COMPRESSION_NONE 0
 #define FLB_GCS_COMPRESSION_GZIP 1
@@ -98,6 +99,7 @@ struct flb_gcs {
     flb_sds_t fs_stream_name;
     struct mk_list upload_queue;
     time_t upload_timeout;
+    size_t total_file_size;
     int retry_time;
     int upload_queue_success;
     int upload_queue_processing;
