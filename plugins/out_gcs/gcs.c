@@ -1196,9 +1196,6 @@ static int process_upload_queue(struct flb_gcs *ctx)
             gcs_store_file_delete(ctx, entry->upload_file);
             flb_free(buffer);
             remove_from_queue(entry);
-            if (ctx->preserve_data_ordering == FLB_TRUE) {
-                break;
-            }
         }
         else {
             flb_free(buffer);
@@ -1295,7 +1292,9 @@ static void cb_gcs_upload(struct flb_config *config, void *data)
         return;
     }
 
+    pthread_mutex_lock(&ctx->upload_lock);
     process_upload_queue(ctx);
+    pthread_mutex_unlock(&ctx->upload_lock);
 }
 
 
@@ -1338,6 +1337,12 @@ static int cb_gcs_init(struct flb_output_instance *ins, struct flb_config *confi
     }
     ctx->ins = ins; ctx->config = config;
     mk_list_init(&ctx->upload_queue);
+    if (pthread_mutex_init(&ctx->upload_lock, NULL) != 0) {
+        flb_errno();
+        flb_free(ctx);
+        return -1;
+    }
+    ctx->upload_lock_initialized = FLB_TRUE;
     ctx->retry_time = 0;
     ctx->upload_queue_success = FLB_FALSE;
     ctx->timer_created = FLB_FALSE;
@@ -1506,25 +1511,20 @@ error:
     return -1;
 }
 
-static void cb_gcs_flush(struct flb_event_chunk *event_chunk, struct flb_output_flush *out_flush,
-                         struct flb_input_instance *i_ins, void *out_context, struct flb_config *config)
+/*
+ * Buffer the payload in the local store and process the upload queue.
+ * Must be called with ctx->upload_lock held; returns an FLB_OUTPUT_RETURN
+ * status code.
+ */
+static int gcs_flush_payload(struct flb_gcs *ctx,
+                             struct flb_event_chunk *event_chunk,
+                             flb_sds_t payload)
 {
-    struct flb_gcs *ctx = out_context;
-    flb_sds_t payload;
     int ret;
     struct gcs_file *chunk;
 
     if (flush_init(ctx) == -1) {
-        FLB_OUTPUT_RETURN(FLB_RETRY);
-    }
-    (void) out_flush;
-    (void) i_ins;
-
-    payload = flb_pack_msgpack_to_json_format(event_chunk->data, event_chunk->size,
-                                              ctx->out_format, ctx->json_date_format,
-                                              ctx->json_date_key, config->json_escape_unicode);
-    if (!payload) {
-        FLB_OUTPUT_RETURN(FLB_RETRY);
+        return FLB_RETRY;
     }
 
     chunk = gcs_store_file_get(ctx, event_chunk->tag, flb_sds_len(event_chunk->tag));
@@ -1535,40 +1535,68 @@ static void cb_gcs_flush(struct flb_event_chunk *event_chunk, struct flb_output_
         ret = seal_and_queue_for_upload(ctx, chunk, event_chunk->tag,
                                         flb_sds_len(event_chunk->tag));
         if (ret == -1) {
-            flb_sds_destroy(payload);
-            FLB_OUTPUT_RETURN(FLB_RETRY);
+            return FLB_RETRY;
         }
         chunk = NULL;
     }
 
     if (gcs_store_buffer_put(ctx, chunk, event_chunk->tag, flb_sds_len(event_chunk->tag),
                              payload, flb_sds_len(payload)) == -1) {
-        flb_sds_destroy(payload);
-        FLB_OUTPUT_RETURN(FLB_RETRY);
+        return FLB_RETRY;
     }
-    flb_sds_destroy(payload);
 
     chunk = gcs_store_file_get(ctx, event_chunk->tag, flb_sds_len(event_chunk->tag));
     if (!chunk) {
-        FLB_OUTPUT_RETURN(FLB_RETRY);
+        return FLB_RETRY;
     }
 
     ret = add_to_queue(ctx, chunk, event_chunk->tag, flb_sds_len(event_chunk->tag));
     if (ret == -1) {
+        return FLB_RETRY;
+    }
+
+    /*
+     * Non-order-preserving mode: try to flush every due queue entry.
+     * Preserve-order mode: flush due entries strictly in FIFO order and
+     * stop at the first failure.
+     */
+    ret = process_upload_queue(ctx);
+    if (ret == -1) {
+        return FLB_ERROR;
+    }
+
+    return FLB_OK;
+}
+
+static void cb_gcs_flush(struct flb_event_chunk *event_chunk, struct flb_output_flush *out_flush,
+                         struct flb_input_instance *i_ins, void *out_context, struct flb_config *config)
+{
+    struct flb_gcs *ctx = out_context;
+    flb_sds_t payload;
+    int ret;
+
+    (void) out_flush;
+    (void) i_ins;
+
+    payload = flb_pack_msgpack_to_json_format(event_chunk->data, event_chunk->size,
+                                              ctx->out_format, ctx->json_date_format,
+                                              ctx->json_date_key, config->json_escape_unicode);
+    if (!payload) {
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
     /*
-     * Non-order-preserving mode: try to flush as many queued entries as possible.
-     * Preserve-order mode: process at most one queue entry per flush to keep
-     * strict FIFO progression.
+     * Flushes may run concurrently from several workers, and the upload
+     * timer runs in one of them: serialize all access to the upload queue,
+     * the local file store and the sequence index. The upstream is in sync
+     * mode, so no coroutine switch happens while the lock is held.
      */
-    ret = process_upload_queue(ctx);
-    if (ret == -1) {
-        FLB_OUTPUT_RETURN(FLB_ERROR);
-    }
+    pthread_mutex_lock(&ctx->upload_lock);
+    ret = gcs_flush_payload(ctx, event_chunk, payload);
+    pthread_mutex_unlock(&ctx->upload_lock);
 
-    FLB_OUTPUT_RETURN(FLB_OK);
+    flb_sds_destroy(payload);
+    FLB_OUTPUT_RETURN(ret);
 }
 
 static int gcs_ctx_destroy(void *data, struct flb_config *config)
@@ -1614,6 +1642,9 @@ static int gcs_ctx_destroy(void *data, struct flb_config *config)
 
     if (ctx->token_mutex_initialized == FLB_TRUE) {
         pthread_mutex_destroy(&ctx->token_mutex);
+    }
+    if (ctx->upload_lock_initialized == FLB_TRUE) {
+        pthread_mutex_destroy(&ctx->upload_lock);
     }
     flb_free(ctx);
 
