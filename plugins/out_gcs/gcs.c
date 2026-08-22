@@ -1269,30 +1269,6 @@ static void cb_gcs_upload(struct flb_config *config, void *data)
 }
 
 
-static void gcs_upload_queue(struct flb_config *config, void *data)
-{
-    int async_flags;
-    struct flb_gcs *ctx = data;
-
-    (void) config;
-
-    if (!ctx) {
-        return;
-    }
-
-    if (mk_list_size(&ctx->upload_queue) == 0) {
-        cb_gcs_upload(config, data);
-        return;
-    }
-
-    async_flags = flb_stream_get_flags(&ctx->u->base);
-    flb_stream_disable_async_mode(&ctx->u->base);
-
-    process_upload_queue(ctx);
-
-    flb_stream_set_flags(&ctx->u->base, async_flags);
-}
-
 static int flush_init(struct flb_gcs *ctx)
 {
     int ret;
@@ -1307,14 +1283,8 @@ static int flush_init(struct flb_gcs *ctx)
         return -1;
     }
 
-    if (ctx->preserve_data_ordering == FLB_TRUE) {
-        ret = flb_sched_timer_cb_create(sched, FLB_SCHED_TIMER_CB_PERM,
-                                        ctx->timer_ms, gcs_upload_queue, ctx, NULL);
-    }
-    else {
-        ret = flb_sched_timer_cb_create(sched, FLB_SCHED_TIMER_CB_PERM,
-                                        ctx->timer_ms, cb_gcs_upload, ctx, NULL);
-    }
+    ret = flb_sched_timer_cb_create(sched, FLB_SCHED_TIMER_CB_PERM,
+                                    ctx->timer_ms, cb_gcs_upload, ctx, NULL);
     if (ret == -1) {
         return -1;
     }
@@ -1437,6 +1407,14 @@ static int cb_gcs_init(struct flb_output_instance *ins, struct flb_config *confi
     }
     /* apply net.* properties (keepalive, timeouts, ...) to the upstream */
     flb_output_upstream_set(ctx->u, ins);
+
+    /*
+     * The upstream must ALWAYS run in sync mode: uploads are also triggered
+     * from the scheduler timer callback (and from init when a backlog is
+     * recovered), which run outside of any coroutine. An async write from
+     * there would try to yield a NULL coroutine and crash.
+     */
+    flb_stream_disable_async_mode(&ctx->u->base);
 
     if (ctx->metadata_server_auth == FLB_TRUE) {
         ctx->metadata_u = flb_upstream_create_url(config, ctx->metadata_server,
