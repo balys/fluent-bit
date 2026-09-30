@@ -7,6 +7,7 @@ import http.server
 import json
 import os
 import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -41,7 +42,8 @@ def _notification(name, generation=1, event_type="OBJECT_FINALIZE"):
 class _FakeGoogle(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, objects, notifications, fail_downloads=None, fail_pulls=0):
+    def __init__(self, objects, notifications, fail_downloads=None, fail_pulls=0,
+                 slow_downloads=None):
         super().__init__(("127.0.0.1", 0), _FakeGoogleHandler)
         self.lock = threading.Lock()
         self.objects = objects
@@ -49,12 +51,16 @@ class _FakeGoogle(http.server.ThreadingHTTPServer):
         self.leased = {}
         self.deliveries = 0
         self.acked = []
+        self.ack_requests = []
         self.deadlines = []
         self.downloads = []
         self.authorization = []
         self.token_requests = []
         self.fail_downloads = dict(fail_downloads or {})
         self.fail_pulls = fail_pulls
+        self.slow_downloads = dict(slow_downloads or {})
+        self.in_flight = 0
+        self.max_in_flight = 0
 
     def pull(self, max_messages):
         with self.lock:
@@ -111,6 +117,7 @@ class _FakeGoogleHandler(http.server.BaseHTTPRequestHandler):
 
         if self.path == f"{SUBSCRIPTION_PATH}:acknowledge":
             with server.lock:
+                server.ack_requests.append(len(body["ackIds"]))
                 for ack_id in body["ackIds"]:
                     server.acked.append(server.leased.pop(ack_id)["attributes"]["objectId"])
             self._reply(200, {})
@@ -160,14 +167,26 @@ class _FakeGoogleHandler(http.server.BaseHTTPRequestHandler):
             failures = server.fail_downloads.get(name, 0)
             if failures > 0:
                 server.fail_downloads[name] = failures - 1
+            delay = server.slow_downloads.get(name, 0)
+            server.in_flight += 1
+            server.max_in_flight = max(server.max_in_flight, server.in_flight)
 
+        try:
+            self._download(name, failures, delay)
+        finally:
+            with server.lock:
+                server.in_flight -= 1
+
+    def _download(self, name, failures, delay):
+        if delay:
+            time.sleep(delay)
         if failures > 0:
             self._reply(503, {"error": {"code": 503}})
             return
-        if name not in server.objects:
+        if name not in self.server.objects:
             self._reply(404, {"error": {"code": 404}})
             return
-        self._reply(200, server.objects[name], "application/octet-stream")
+        self._reply(200, self.server.objects[name], "application/octet-stream")
 
 
 @contextlib.contextmanager
@@ -183,7 +202,7 @@ def _fake_google(objects, notifications, **kwargs):
         thread.join()
 
 
-def _write_config(tmp_path, port, input_options):
+def _write_config(tmp_path, port, input_options, inputs=1):
     parsers = tmp_path / "parsers.conf"
     parsers.write_text(
         "\n".join(
@@ -221,19 +240,22 @@ def _write_config(tmp_path, port, input_options):
         f"    Parsers_File {parsers}",
         "    HTTP_Server  On",
         "    HTTP_Port    ${FLUENT_BIT_HTTP_MONITORING_PORT}",
-        "",
-        "[INPUT]",
-        "    Name             gcs",
-        "    Tag              gcs",
-        f"    subscription     {SUBSCRIPTION}",
-        f"    project_id       {PROJECT}",
-        f"    pubsub_endpoint  http://127.0.0.1:{port}",
-        f"    storage_endpoint http://127.0.0.1:{port}",
-        "    object_key       gcs_object",
-        "    interval_sec     0",
-        "    interval_nsec    200000000",
     ]
-    lines += [f"    {option}" for option in input_options]
+    for _ in range(inputs):
+        lines += [
+            "",
+            "[INPUT]",
+            "    Name             gcs",
+            "    Tag              gcs",
+            f"    subscription     {SUBSCRIPTION}",
+            f"    project_id       {PROJECT}",
+            f"    pubsub_endpoint  http://127.0.0.1:{port}",
+            f"    storage_endpoint http://127.0.0.1:{port}",
+            "    object_key       gcs_object",
+            "    interval_sec     0",
+            "    interval_nsec    200000000",
+        ]
+        lines += [f"    {option}" for option in input_options]
     lines += [
         "",
         "[OUTPUT]",
@@ -256,8 +278,8 @@ def _records(log_file):
     return records
 
 
-def _run(tmp_path, server, input_options, expected_records):
-    config = _write_config(tmp_path, server.server_address[1], input_options)
+def _run(tmp_path, server, input_options, expected_records, inputs=1):
+    config = _write_config(tmp_path, server.server_address[1], input_options, inputs)
     service = FluentBitTestService(os.fspath(config))
     service.start()
     log_file = service.flb.log_file
@@ -328,6 +350,8 @@ def test_in_gcs_reads_notified_objects(tmp_path, monkeypatch):
     assert by_body["no timestamp"] == {"date", "log", "gcs_object"}
 
     assert sorted(server.acked) == sorted(n["attributes"]["objectId"] for n in notifications)
+    # one acknowledge call per pulled batch of up to 3
+    assert server.ack_requests == [3, 3, 2]
     assert server.deadlines == []
 
     downloaded = [d[0] for d in server.downloads]
@@ -367,6 +391,43 @@ def test_in_gcs_redelivers_failed_downloads(tmp_path):
     assert [d[2] for d in server.downloads] == [["7"]] * 3
     assert set(server.authorization) == {None}
     assert log_text.count("failed: status=503") == 2
+
+
+def test_in_gcs_renews_leases_of_a_slow_batch(tmp_path):
+    names = ["app/slow.log", "app/b.log", "app/c.log"]
+    objects = {name: f"2024-01-02T03:04:05.000Z {name}\n".encode("utf-8") for name in names}
+
+    with _fake_google(objects, [_notification(name) for name in names],
+                      slow_downloads={"app/slow.log": 6}) as server:
+        records, _ = _run(
+            tmp_path, server,
+            ["auth none", "parser iso_line", "ack_deadline 10", "max_messages 3"],
+            expected_records=3,
+        )
+
+    assert sorted(r["msg"] for r in records) == sorted(names)
+    # after half the deadline the finished object is acked and the rest renewed
+    assert server.deadlines == [(n, 10) for n in names] + [(n, 10) for n in names[1:]]
+    assert server.acked == names
+    assert server.ack_requests == [1, 2]
+    assert server.deliveries == 3
+
+
+def test_in_gcs_inputs_on_one_subscription_run_in_parallel(tmp_path):
+    names = ["app/a.log", "app/b.log"]
+    objects = {name: f"2024-01-02T03:04:05.000Z {name}\n".encode("utf-8") for name in names}
+
+    with _fake_google(objects, [_notification(name) for name in names],
+                      slow_downloads={name: 3 for name in names}) as server:
+        records, _ = _run(
+            tmp_path, server,
+            ["auth none", "parser iso_line", "max_messages 1"],
+            expected_records=2, inputs=2,
+        )
+
+    assert sorted(r["msg"] for r in records) == names
+    assert server.max_in_flight == 2
+    assert server.deliveries == 2
 
 
 def test_in_gcs_refreshes_token_after_401(tmp_path, monkeypatch):
