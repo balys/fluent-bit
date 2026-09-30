@@ -793,13 +793,17 @@ static int cb_gcs_collect(struct flb_input_instance *ins,
     int count;
     int acked = 0;
     int retried = 0;
+    int n_ack = 0;
+    int n_retry = 0;
+    time_t leased_at;
     char *buf = NULL;
     size_t size = 0;
     size_t off = 0;
     msgpack_unpacked result;
     msgpack_object *messages;
-    msgpack_object *ack_id;
     msgpack_object **pending = NULL;
+    msgpack_object **to_ack;
+    msgpack_object **to_retry;
     struct flb_in_gcs *ctx = in_context;
 
     if (flb_input_paused(ins) == FLB_TRUE) {
@@ -822,11 +826,13 @@ static int cb_gcs_collect(struct flb_input_instance *ins,
     }
     count = messages->via.array.size;
 
-    pending = flb_calloc(count, sizeof(msgpack_object *));
+    pending = flb_calloc(count * 3, sizeof(msgpack_object *));
     if (!pending) {
         flb_errno();
         goto done;
     }
+    to_ack = pending + count;
+    to_retry = pending + count * 2;
     for (i = 0; i < count; i++) {
         pending[i] = map_lookup(&messages->via.array.ptr[i], "ackId");
         if (!pending[i] || pending[i]->type != MSGPACK_OBJECT_STR) {
@@ -835,31 +841,48 @@ static int cb_gcs_collect(struct flb_input_instance *ins,
         }
     }
 
+    leased_at = time(NULL);
     if (ctx->ack_deadline > 0) {
         pubsub_ack(ctx, pending, count, ctx->ack_deadline);
     }
 
     for (i = 0; i < count; i++) {
-        ack_id = pending[i];
-
         if (flb_input_paused(ins) == FLB_TRUE) {
             /* hand the rest back to Pub/Sub; it redelivers them later */
-            pubsub_ack(ctx, &pending[i], count - i, 0);
-            retried += count - i;
+            for (; i < count; i++) {
+                to_retry[n_retry++] = pending[i];
+            }
             break;
+        }
+
+        /* settle what is done and renew the rest before their leases expire */
+        if (ctx->ack_deadline > 0 &&
+            time(NULL) - leased_at >= ctx->ack_deadline / 2) {
+            if (pubsub_ack(ctx, to_ack, n_ack, -1) == 0) {
+                acked += n_ack;
+            }
+            pubsub_ack(ctx, to_retry, n_retry, 0);
+            retried += n_retry;
+            n_ack = 0;
+            n_retry = 0;
+            pubsub_ack(ctx, &pending[i], count - i, ctx->ack_deadline);
+            leased_at = time(NULL);
         }
 
         ret = process_message(ctx, &messages->via.array.ptr[i]);
         if (ret == FLB_IN_GCS_ACK) {
-            if (pubsub_ack(ctx, &ack_id, 1, -1) == 0) {
-                acked++;
-            }
+            to_ack[n_ack++] = pending[i];
         }
         else {
-            pubsub_ack(ctx, &ack_id, 1, 0);
-            retried++;
+            to_retry[n_retry++] = pending[i];
         }
     }
+
+    if (pubsub_ack(ctx, to_ack, n_ack, -1) == 0) {
+        acked += n_ack;
+    }
+    pubsub_ack(ctx, to_retry, n_retry, 0);
+    retried += n_retry;
 
     flb_plg_debug(ctx->ins, "pulled %i notifications: %i acked, %i retried",
                   count, acked, retried);
