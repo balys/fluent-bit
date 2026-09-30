@@ -54,6 +54,7 @@ class _FakeGoogle(http.server.ThreadingHTTPServer):
         self.ack_requests = []
         self.deadlines = []
         self.downloads = []
+        self.accept_encoding = []
         self.authorization = []
         self.token_requests = []
         self.fail_downloads = dict(fail_downloads or {})
@@ -164,6 +165,7 @@ class _FakeGoogleHandler(http.server.BaseHTTPRequestHandler):
         with server.lock:
             server.authorization.append(self.headers.get("Authorization"))
             server.downloads.append((encoded, query.get("alt"), query.get("generation")))
+            server.accept_encoding.append(self.headers.get("Accept-Encoding"))
             failures = server.fail_downloads.get(name, 0)
             if failures > 0:
                 server.fail_downloads[name] = failures - 1
@@ -186,7 +188,18 @@ class _FakeGoogleHandler(http.server.BaseHTTPRequestHandler):
         if name not in self.server.objects:
             self._reply(404, {"error": {"code": 404}})
             return
-        self._reply(200, self.server.objects[name], "application/octet-stream")
+        # like GCS over HTTP/1.1: a chunked body, and the stored size in a header
+        # whose name ends in 'Content-Length'
+        body = self.server.objects[name]
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("X-Goog-Stored-Content-Length", str(len(body)))
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for offset in range(0, len(body), 16):
+            chunk = body[offset:offset + 16]
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+        self.wfile.write(b"0\r\n\r\n")
 
 
 @contextlib.contextmanager
@@ -359,6 +372,8 @@ def test_in_gcs_reads_notified_objects(tmp_path, monkeypatch):
     assert all(alt == ["media"] and generation == ["1"] for _, alt, generation in server.downloads)
     # the delete notification is acked without a download
     assert len(server.downloads) == len(notifications) - 1
+    # gzip objects are fetched as stored, not decompressed by GCS
+    assert set(server.accept_encoding) == {"gzip"}
 
     assert len(server.token_requests) == 1
     assert server.authorization and set(server.authorization) == {"Bearer token-1"}
