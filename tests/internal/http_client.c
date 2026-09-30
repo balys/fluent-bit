@@ -752,6 +752,95 @@ void test_http_response_chunked_trailers()
     test_ctx_destroy(ctx);
 }
 
+/*
+ * Google Cloud Storage answers downloads with a chunked body and an
+ * 'X-Goog-Stored-Content-Length' header, which must not be taken for
+ * 'Content-Length'.
+ */
+void test_http_response_header_suffix_chunked()
+{
+    int ret;
+    struct test_ctx *ctx;
+    struct flb_http_client *c;
+
+    ctx = test_ctx_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    c = flb_http_client(ctx->u_conn, FLB_HTTP_GET, "/", NULL, 0,
+                        "127.0.0.1", 80, NULL, FLB_HTTP_11);
+    if (!TEST_CHECK(c != NULL)) {
+        TEST_MSG("flb_http_client failed");
+        test_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    append_response_fragment(c,
+                             "HTTP/1.1 200 OK\r\n"
+                             "X-Goog-Stored-Content-Length: 4\r\n"
+                             "X-Transfer-Encoding: identity\r\n"
+                             "Transfer-Encoding: chunked\r\n"
+                             "\r\n"
+                             "4\r\n"
+                             "Wiki\r\n"
+                             "5\r\n"
+                             "pedia\r\n"
+                             "0\r\n"
+                             "\r\n");
+
+    ret = flb_http_client_process_response_buffer(c);
+    TEST_CHECK(ret == FLB_HTTP_OK);
+    TEST_CHECK(c->resp.content_length == -1);
+    TEST_CHECK(c->resp.chunked_encoding == FLB_TRUE);
+    TEST_CHECK(c->resp.payload_size == strlen("Wikipedia"));
+    TEST_CHECK(strncmp(c->resp.payload, "Wikipedia", strlen("Wikipedia")) == 0);
+
+    flb_http_client_destroy(c);
+    test_ctx_destroy(ctx);
+}
+
+void test_http_response_header_suffix_content_length()
+{
+    int ret;
+    struct test_ctx *ctx;
+    struct flb_http_client *c;
+
+    ctx = test_ctx_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    c = flb_http_client(ctx->u_conn, FLB_HTTP_GET, "/", NULL, 0,
+                        "127.0.0.1", 80, NULL, FLB_HTTP_11);
+    if (!TEST_CHECK(c != NULL)) {
+        TEST_MSG("flb_http_client failed");
+        test_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    /* headers only: the real Content-Length has not arrived yet */
+    append_response_fragment(c,
+                             "HTTP/1.1 200 OK\r\n"
+                             "X-Goog-Stored-Content-Length: 4\r\n");
+    ret = flb_http_client_process_response_buffer(c);
+    TEST_CHECK(ret == FLB_HTTP_MORE);
+    TEST_CHECK(c->resp.content_length == -1);
+
+    append_response_fragment(c,
+                             "content-length: 9\r\n"
+                             "\r\n"
+                             "Wikipedia");
+    ret = flb_http_client_process_response_buffer(c);
+    TEST_CHECK(ret == FLB_HTTP_OK);
+    TEST_CHECK(c->resp.content_length == 9);
+    TEST_CHECK(c->resp.payload_size == strlen("Wikipedia"));
+    TEST_CHECK(strncmp(c->resp.payload, "Wikipedia", strlen("Wikipedia")) == 0);
+
+    flb_http_client_destroy(c);
+    test_ctx_destroy(ctx);
+}
+
 void test_http_response_chunked_incremental()
 {
     int ret;
@@ -1137,6 +1226,8 @@ TEST_LIST = {
     { "https_ipv6_zone_id_default_port_host_header", test_https_ipv6_zone_id_default_port_host_header},
     { "https_ipv6_zone_id_non_standard_port_host_header", test_https_ipv6_zone_id_non_standard_port_host_header},
     { "response_header_lookup", test_http_response_header_lookup},
+    { "response_header_suffix_chunked", test_http_response_header_suffix_chunked},
+    { "response_header_suffix_content_length", test_http_response_header_suffix_content_length},
     { "response_chunked_trailers", test_http_response_chunked_trailers},
     { "response_chunked_incremental", test_http_response_chunked_incremental},
     { "response_chunked_invalid_trailer", test_http_response_chunked_invalid_trailer},
