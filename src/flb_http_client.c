@@ -141,9 +141,23 @@ static int header_lookup(struct flb_http_client *c,
         return FLB_HTTP_MORE;
     }
 
-    /* Lookup the beginning of the header */
-    p = strcasestr(c->resp.data, header);
+    /*
+     * Lookup the beginning of the header. It must start a line, so that e.g.
+     * 'Content-Length: ' does not match 'X-Goog-Stored-Content-Length: '.
+     */
     end = strstr(c->resp.data, "\r\n\r\n");
+    p = c->resp.data;
+    while ((p = strcasestr(p, header)) != NULL) {
+        /* Exclude matches in the body */
+        if (end && p > end) {
+            return FLB_HTTP_NOT_FOUND;
+        }
+        if (p > c->resp.data && p[-1] == '\n') {
+            break;
+        }
+        p++;
+    }
+
     if (!p) {
         if (end) {
             /* The headers are complete but the header is not there */
@@ -152,11 +166,6 @@ static int header_lookup(struct flb_http_client *c,
 
         /* We need more data */
         return FLB_HTTP_MORE;
-    }
-
-    /* Exclude matches in the body */
-    if (end && p > end) {
-        return FLB_HTTP_NOT_FOUND;
     }
 
     /* Lookup CRLF (end of line \r\n) */
