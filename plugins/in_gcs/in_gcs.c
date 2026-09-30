@@ -269,6 +269,13 @@ static struct flb_http_client *api_call(struct flb_in_gcs *ctx,
 
     flb_http_buffer_size(c, max_size);
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
+    if (ep == &ctx->storage) {
+        /*
+         * Download gzip objects as stored instead of letting GCS decompress
+         * them (decompressive transcoding); they are gunzipped here.
+         */
+        flb_http_add_header(c, "Accept-Encoding", 15, "gzip", 4);
+    }
     if (body) {
         flb_http_add_header(c, "Content-Type", 12, "application/json", 16);
     }
