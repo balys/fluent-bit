@@ -23,9 +23,10 @@
  * The bucket publishes OBJECT_FINALIZE notifications to a Pub/Sub topic. The
  * plugin pulls a subscription of that topic, downloads each object (gzip is
  * detected by its magic bytes), splits it into lines and appends one record
- * per line. A notification is acknowledged only after all of its records were
- * appended, so a crash or a failed append redelivers the object instead of
- * losing it (use 'storage.type filesystem' to survive restarts).
+ * per line. A notification is acknowledged only after the engine took all of
+ * its records into its buffer, so a crash, a failed append or a shutdown
+ * redelivers the object instead of losing it (use 'storage.type filesystem'
+ * to survive restarts).
  */
 
 #include <fluent-bit/flb_gzip.h>
@@ -34,10 +35,12 @@
 #include <fluent-bit/flb_log_event_encoder.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_parser.h>
+#include <fluent-bit/flb_ring_buffer.h>
 #include <fluent-bit/flb_strptime.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_utils.h>
 
+#include <lwrb/lwrb.h>
 #include <msgpack.h>
 #include <ctype.h>
 #include <string.h>
@@ -792,6 +795,80 @@ done:
     return ret;
 }
 
+/* Lease ages are tracked in ms; time() would move renewals by up to a second. */
+static uint64_t now_ms(void)
+{
+    struct flb_time t;
+
+    flb_time_get(&t);
+    return flb_time_to_millisec(&t);
+}
+
+/*
+ * A threaded input hands its records to the engine through a ring buffer. The
+ * engine moves them into chunks on its own thread and drops what is still
+ * queued when it shuts down, so wait until it took everything. The leases of
+ * 'to_ack' and of 'rest' (not processed yet) are renewed meanwhile. Returns -1
+ * if the engine starts shutting down first.
+ */
+static int wait_records_taken(struct flb_in_gcs *ctx,
+                              msgpack_object **to_ack, int n_ack,
+                              msgpack_object **rest, int n_rest, uint64_t *leased_at)
+{
+    size_t queued;
+    struct flb_input_instance *ins = ctx->ins;
+    struct flb_ring_buffer *rb = ins->rb;
+
+    if (!flb_input_is_threaded(ins) || !rb) {
+        return 0;
+    }
+
+    while (1) {
+        pthread_mutex_lock(&rb->lock);
+        queued = lwrb_get_full(rb->ctx);
+        pthread_mutex_unlock(&rb->lock);
+        if (queued == 0) {
+            return 0;
+        }
+
+        if (ins->config->is_shutting_down == FLB_TRUE) {
+            return -1;
+        }
+
+        /* renew before the leases run out */
+        if (ctx->ack_deadline > 0 &&
+            now_ms() - *leased_at >= (uint64_t) ctx->ack_deadline * 750) {
+            pubsub_ack(ctx, to_ack, n_ack, ctx->ack_deadline);
+            pubsub_ack(ctx, rest, n_rest, ctx->ack_deadline);
+            *leased_at = now_ms();
+        }
+        flb_time_msleep(10);
+    }
+}
+
+/* Ack the objects once the engine took their records, hand the others back. */
+static int settle(struct flb_in_gcs *ctx,
+                  msgpack_object **to_ack, int n_ack,
+                  msgpack_object **to_retry, int n_retry,
+                  msgpack_object **rest, int n_rest, uint64_t *leased_at)
+{
+    int acked = 0;
+
+    if (wait_records_taken(ctx, to_ack, n_ack, rest, n_rest, leased_at) == 0) {
+        if (pubsub_ack(ctx, to_ack, n_ack, -1) == 0) {
+            acked = n_ack;
+        }
+    }
+    else if (n_ack > 0) {
+        flb_plg_warn(ctx->ins, "shutting down before %i objects were buffered, "
+                     "handing them back", n_ack);
+        pubsub_ack(ctx, to_ack, n_ack, 0);
+    }
+    pubsub_ack(ctx, to_retry, n_retry, 0);
+
+    return acked;
+}
+
 static int cb_gcs_collect(struct flb_input_instance *ins,
                           struct flb_config *config, void *in_context)
 {
@@ -802,7 +879,7 @@ static int cb_gcs_collect(struct flb_input_instance *ins,
     int retried = 0;
     int n_ack = 0;
     int n_retry = 0;
-    time_t leased_at;
+    uint64_t leased_at;
     char *buf = NULL;
     size_t size = 0;
     size_t off = 0;
@@ -813,7 +890,8 @@ static int cb_gcs_collect(struct flb_input_instance *ins,
     msgpack_object **to_retry;
     struct flb_in_gcs *ctx = in_context;
 
-    if (flb_input_paused(ins) == FLB_TRUE) {
+    /* records taken now would be dropped at shutdown */
+    if (flb_input_paused(ins) == FLB_TRUE || config->is_shutting_down == FLB_TRUE) {
         return 0;
     }
 
@@ -848,13 +926,13 @@ static int cb_gcs_collect(struct flb_input_instance *ins,
         }
     }
 
-    leased_at = time(NULL);
+    leased_at = now_ms();
     if (ctx->ack_deadline > 0) {
         pubsub_ack(ctx, pending, count, ctx->ack_deadline);
     }
 
     for (i = 0; i < count; i++) {
-        if (flb_input_paused(ins) == FLB_TRUE) {
+        if (flb_input_paused(ins) == FLB_TRUE || config->is_shutting_down == FLB_TRUE) {
             /* hand the rest back to Pub/Sub; it redelivers them later */
             for (; i < count; i++) {
                 to_retry[n_retry++] = pending[i];
@@ -864,16 +942,17 @@ static int cb_gcs_collect(struct flb_input_instance *ins,
 
         /* settle what is done and renew the rest before their leases expire */
         if (ctx->ack_deadline > 0 &&
-            time(NULL) - leased_at >= ctx->ack_deadline / 2) {
-            if (pubsub_ack(ctx, to_ack, n_ack, -1) == 0) {
-                acked += n_ack;
-            }
-            pubsub_ack(ctx, to_retry, n_retry, 0);
+            now_ms() - leased_at >= (uint64_t) ctx->ack_deadline * 500) {
+            acked += settle(ctx, to_ack, n_ack, to_retry, n_retry,
+                            &pending[i], count - i, &leased_at);
             retried += n_retry;
             n_ack = 0;
             n_retry = 0;
-            pubsub_ack(ctx, &pending[i], count - i, ctx->ack_deadline);
-            leased_at = time(NULL);
+            /* unless the wait for the engine renewed them already */
+            if (now_ms() - leased_at >= (uint64_t) ctx->ack_deadline * 500) {
+                pubsub_ack(ctx, &pending[i], count - i, ctx->ack_deadline);
+                leased_at = now_ms();
+            }
         }
 
         ret = process_message(ctx, &messages->via.array.ptr[i]);
@@ -885,10 +964,7 @@ static int cb_gcs_collect(struct flb_input_instance *ins,
         }
     }
 
-    if (pubsub_ack(ctx, to_ack, n_ack, -1) == 0) {
-        acked += n_ack;
-    }
-    pubsub_ack(ctx, to_retry, n_retry, 0);
+    acked += settle(ctx, to_ack, n_ack, to_retry, n_retry, NULL, 0, &leased_at);
     retried += n_retry;
 
     flb_plg_debug(ctx->ins, "pulled %i notifications: %i acked, %i retried",
