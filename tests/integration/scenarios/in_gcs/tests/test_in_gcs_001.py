@@ -462,3 +462,32 @@ def test_in_gcs_refreshes_token_after_401(tmp_path, monkeypatch):
     assert len(server.token_requests) == 2
     assert server.authorization[0] == "Bearer token-1"
     assert set(server.authorization[1:]) == {"Bearer token-2"}
+
+
+def test_in_gcs_hands_back_objects_still_queued_at_shutdown(tmp_path):
+    name = "app/queued.log"
+    objects = {name: b"2024-01-02T03:04:05.000Z queued\n"}
+
+    with _fake_google(objects, [_notification(name)]) as server:
+        config = _write_config(tmp_path, server.server_address[1],
+                               ["auth none", "parser iso_line", "ack_deadline 30"])
+        # the engine takes records off the input's ring buffer every 60 s instead
+        # of every 250 ms, so they are still queued when Fluent Bit stops
+        service = FluentBitTestService(os.fspath(config), extra_env={"FLB_DEV_RB_MS": "60000"})
+        service.start()
+        try:
+            service.wait_for_condition(
+                lambda: len(server.downloads) == 1,
+                timeout=30,
+                interval=0.1,
+                description="the object downloaded",
+            )
+            time.sleep(1)
+        finally:
+            service.stop()
+        records = _records(service.flb.log_file)
+
+    # the engine drops queued records at shutdown, so the object must go back to Pub/Sub
+    assert records == []
+    assert server.acked == []
+    assert server.deadlines == [(name, 30), (name, 0)]
